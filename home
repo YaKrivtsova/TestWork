@@ -1,0 +1,223 @@
+using System;
+using System.Collections.Generic;
+using System.Data.SqlClient;
+using System.Diagnostics;
+using System.Linq;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
+using WebApplication1.Models;
+
+namespace WebApplication1.Controllers
+{
+    public class HomeController : Controller
+    {
+        private readonly IConfiguration Configuration;
+        private readonly int user_id=7;
+        private readonly int apiid = 4;
+        public HomeController(IConfiguration config)
+        {
+            Configuration = config;
+
+        }
+        public IActionResult sendInvites(string[] phone_numbers ,string message)
+        {
+            
+            try
+            {
+                int countMessage = Int32.Parse(Configuration["countMessage"]);
+                message= Transliterator.Convert(message);
+                bool valid_phones = false;
+                if (Request.Headers["user_id"] == user_id)
+                {
+                    List<string> list = new List<string>(phone_numbers);
+                    var sendMess = getcountinvitations(Configuration["connectionString"], Configuration["procedureName"]);
+                    if (sendMess==-1)
+                    {
+                        return StatusCode(StatusCodes.Status500InternalServerError, new Response { ErrorCode = -1, ErrorMessage = $"SMS_SERVICE: DB can't get sent message" });
+                    }
+                    else if (sendMess+list.Count>128)
+                    {
+                        return StatusCode(StatusCodes.Status403Forbidden, new Response { ErrorCode = -1, ErrorMessage = $"403 BAD_REQUEST PHONE_NUMBERS_INVALID: Too much phone numbers, should be less or equal to 128 per day." });
+                    }
+                    else if (!IsGSM(message))
+                    {
+                        return StatusCode(StatusCodes.Status406NotAcceptable, new Response { ErrorCode = -1, ErrorMessage = $"406 BAD_REQUEST MESSAGE_INVALID: Invite message should contain only characters in 7-bit GSM encoding or Cyrillic letters as well." });
+                    }
+                    else if (!OnlyLat(message)&&message.Length>128|| OnlyLat(message)&&message.Length > 160)
+                    {
+                        return StatusCode(StatusCodes.Status407ProxyAuthenticationRequired, new Response { ErrorCode = -1, ErrorMessage = $"407 BAD_REQUEST MESSAGE_INVALID: Invite message too long, should be less or equal to 128 characters of 7-bit GSM charset." });
+                    }
+                    else if (string.IsNullOrEmpty(message))
+                    {
+                        return StatusCode(StatusCodes.Status405MethodNotAllowed, new Response { ErrorCode = -1, ErrorMessage = $"405 BAD_REQUEST MESSAGE_EMPTY: Invite message is missing" });
+                    }
+                    else if (list.Count==0)
+                    {
+                        return StatusCode(StatusCodes.Status401Unauthorized, new Response { ErrorCode = -1, ErrorMessage = $"401 BAD_REQUEST PHONE_NUMBERS_EMPTY: Phone_numbers is missing" });
+                    }
+                    else if (list.Count> countMessage)
+                    {
+                        return StatusCode(StatusCodes.Status402PaymentRequired, new Response { ErrorCode = -1, ErrorMessage = $"402 BAD_REQUEST PHONE_NUMBERS_INVALID: Too much phone numbers, should be less or equal to 16 per request." });
+                    }
+                    else if(list.GroupBy(x => x).Select(g=> new { Name = g.Key, Count = g.Count() }).Any(x => x.Count > 1))
+                    {
+                        return StatusCode(StatusCodes.Status404NotFound, new Response { ErrorCode = -1, ErrorMessage = $"404 BAD_REQUEST PHONE_NUMBERS_INVALID: Duplicate numbers detected." });
+                    }
+                    else if (!list.Any(x=>IsPhoneNumber(x)))
+                    {
+                        return StatusCode(StatusCodes.Status400BadRequest, new Response { ErrorCode = -1, ErrorMessage = $"400 BAD_REQUEST PHONE_NUMBERS_INVALID: One or several phone numbers do not match with international format." });
+                    }
+                    else
+                    {
+                        foreach(var item in list)
+                        {
+                            if (!invite(Configuration["connectionString"], Configuration["procedureName"], item))
+                            {
+                                return StatusCode(StatusCodes.Status500InternalServerError, new Response { ErrorCode = -1, ErrorMessage = $"SMS_SERVICE: DB can't send message" });
+                            }
+                        }
+                    }
+                    return Ok();
+                }
+
+            }
+            catch (Exception e)
+            {
+                return StatusCode(StatusCodes.Status500InternalServerError, new Response { ErrorCode = -1, ErrorMessage = $"SMS_SERVICE:{e.Message}|{e.StackTrace}" });
+            }
+            
+            return View();
+
+        }
+
+
+        public static bool IsPhoneNumber(string phoneNumber) => Regex.IsMatch(phoneNumber, "^[0-9]{11}$");
+        public static bool OnlyLat(string message) => Regex.IsMatch(message, @"^[a-zA-Z]+$");
+        public static bool IsGSM(string message) => Regex.IsMatch(message, "^[0-9a-zA-Z@£$¥èéùìòÇ\nØø\rÅå\u0394_\u03A6\u0393\u039B\u03A9\u03A0\u03A8\u03A3\u0398\u039E\u20ACÆæßÉ\\s!\"#$%&amp;'()*+,./:;&lt;=&gt;?¡ÄÖÑÜ§¿äöñüà^{}\\\\\\[~\\]|]+$");
+        public class Response
+        {
+            public int ErrorCode { get; set; }
+            public string ErrorMessage { get; set; }
+        }
+        public class Transliterator
+        {
+            private static char[] _rus;
+            private static string[] _lat;
+
+            private static Dictionary<char, string> _map = new Dictionary<char, string>();
+
+            static Transliterator()
+            {
+                _rus = new char[]
+                {
+                'а', 'б', 'в', 'г', 'д', 'е', 'ё', 'ж', 'з', 'и', 'й',
+                'к', 'л', 'м', 'н', 'о', 'п', 'р', 'с', 'т', 'у', 'ф',
+                'х', 'ц', 'ч', 'ш', 'щ', 'ъ', 'ы', 'ь', 'э', 'ю', 'я',
+                'А', 'Б', 'В', 'Г', 'Д', 'Е', 'Ё', 'Ж', 'З', 'И', 'Й',
+                'К', 'Л', 'М', 'Н', 'О', 'П', 'Р', 'С', 'Т', 'У', 'Ф',
+                'Х', 'Ц', 'Ч', 'Ш', 'Щ', 'Ъ', 'Ы', 'Ь', 'Э', 'Ю', 'Я'
+                };
+                _lat = new string[]
+                {
+                "a", "b", "v", "g", "d", "e", "e", "zh", "z", "i", "i",
+                "k", "l", "m", "n", "o", "p", "r", "s", "t", "u", "f",
+                "kh", "ts", "ch", "sh", "shch", "ie", "y", "", "e", "iu", "ia",
+                "A", "B", "V", "G", "D", "E", "E", "ZH", "Z", "I", "I",
+                "K", "L", "M", "N", "O", "P", "R", "S", "T", "U", "F",
+                "KH", "TS", "CH", "SH", "SHCH", "IE", "Y", "", "E", "IU", "IA"
+                };
+                for (int i = 0; i < _rus.Length; i++)
+                {
+                    _map.Add(_rus[i], _lat[i]);
+                }
+            }
+
+            public static string Convert(string s)
+            {
+                if (s == null)
+                {
+                    return null;
+                }
+                // Исключение для России
+                if (s.ToLower() == "российская федерация")
+                {
+                    return "Russian Federation";
+                }
+                if (s.ToLower() == "россия")
+                {
+                    return "Russia";
+                }
+                var parts = s.Select(x => _map.ContainsKey(x) ? _map[x] : "" + x);
+                StringBuilder res = new StringBuilder();
+                foreach (var p in parts)
+                {
+                    res.Append(p);
+                }
+                return res.ToString();
+            }
+            
+
+        }
+
+        
+            public int getcountinvitations( string connectionString, string proc)
+            {
+                try
+                {
+                    using (SqlConnection connection = new SqlConnection(connectionString))
+                    {
+                        connection.Open();
+                        SqlCommand command = new SqlCommand(proc, connection);
+                        command.CommandType = System.Data.CommandType.StoredProcedure;
+                        command.Parameters.Add(new SqlParameter
+                        {
+                            ParameterName = "@apiid",
+                            Value = apiid
+                        });
+                        return Int32.Parse(command.ExecuteScalar().ToString());
+                    }
+                }
+                catch (Exception e)
+                {
+                    return -1;
+                }
+
+            }
+             public bool invite( string connectionString, string proc, string phones)
+             {
+                try
+                {
+                    using (SqlConnection connection = new SqlConnection(connectionString))
+                    {
+                        connection.Open();
+                        SqlCommand command = new SqlCommand(proc, connection);
+                        command.CommandType = System.Data.CommandType.StoredProcedure;
+                        command.Parameters.Add(new SqlParameter
+                        {
+                            ParameterName = "@user_id",
+                            Value = user_id
+                        });
+                        command.Parameters.Add(new SqlParameter
+                        {
+                            ParameterName = "@phones",
+                            Value = phones
+                        });
+                    command.ExecuteNonQuery();
+                    }
+                    return true;
+                }
+                catch (Exception e)
+                {
+                    return false;
+                }
+
+             }
+
+
+    }
+}
